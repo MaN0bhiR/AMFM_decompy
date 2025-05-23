@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "AMFM_decompy"
-version = "1.0.12"
+version = "1.0.12.2"
 description = "Package containing the tools necessary for decomposing a speech signal into its modulated components, aka AM-FM decomposition."
 readme = "README.md"
 requires-python = ">=3.5"

@@ -52,7 +52,7 @@ should be rewritten in the 1.0.7 and later versions as
 Installation
 =============
 
-The pypi page https://pypi.python.org/pypi/AMFM_decompy/1.0.12 is recommended for a quick installation. But you can also copy all directories here and then run
+The pypi page https://pypi.python.org/pypi/AMFM_decompy/1.0.12.2 is recommended for a quick installation. But you can also copy all directories here and then run
 
 ```python setup.py install```
 
