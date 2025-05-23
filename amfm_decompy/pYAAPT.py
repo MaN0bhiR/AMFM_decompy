@@ -46,7 +46,7 @@ from scipy.signal import firwin, medfilt, lfilter
 from scipy.signal.windows import hann, kaiser
 import scipy.interpolate as scipy_interp
 
-import basic_tools as basic
+import amfm.basic_tools as basic
 
 
 """
