@@ -16,15 +16,15 @@ USAGE:
     Please refer to the documentation for examples.
 
 References:
-    [1] Y. Pantazis, “Decomposition of AM-FM signals with applications in
-        speech processing”, PhD Thesis, University of Creta, 2010.
+    [1] Y. Pantazis, "Decomposition of AM-FM signals with applications in
+        speech processing", PhD Thesis, University of Creta, 2010.
 
-    [2] Y. Pantazis, O. Rosec and Y. Stylianou, “Adaptive AM-FM signal
-        decomposition with application to speech analysis”, IEEE Transactions
+    [2] Y. Pantazis, O. Rosec and Y. Stylianou, "Adaptive AM-FM signal
+        decomposition with application to speech analysis", IEEE Transactions
         on Audio, Speech and Language Processing, vol. 19, n 2, 2011.
 
-    [3] G. P. Kafentzis, Y. Pantazis, O. Rosec and Y. Stylianou, “An extension
-        of the adaptive quasi-harmonic model”, em IEEE International Conference
+    [3] G. P. Kafentzis, Y. Pantazis, O. Rosec and Y. Stylianou, "An extension
+        of the adaptive quasi-harmonic model", em IEEE International Conference
         on Acoustics, Speech and Signal Processing (ICASSP), 2012.
 
 Version 1.0.12
@@ -33,6 +33,20 @@ Version 1.0.12
 
 import numpy as np
 import scipy
+import os
+
+# Try to import CUDA utilities
+try:
+    from .cuda_utils import (
+        CUDA_AVAILABLE, 
+        get_cuda_info,
+        cuda_exp_matrix, 
+        cuda_least_squares
+    )
+    _has_cuda = True
+except ImportError:
+    _has_cuda = False
+    CUDA_AVAILABLE = False
 
 """
 --------------------------------------------
@@ -75,6 +89,7 @@ class ModulatedSign(object):
         self.harmonics = [ComponentObj(self.H, i) for i in range(self.n_harm)]
         self.error = np.zeros(self.size)
         self.phase_tech = phase_tech
+        self.use_cuda = CUDA_AVAILABLE and os.environ.get('AMFM_USE_CUDA', '1') == '1'
 
     """
     Updates the 3-dimension array H, which stores the magnitude, phase and
@@ -189,12 +204,12 @@ class ModulatedSign(object):
             old_phase = self.extrap_phase[:, beg+1].reshape(self.n_harm, 1)
             freq = self.H[:, 2, beg+1].reshape(self.n_harm, 1)
             self.extrap_phase[:, beg-window.N+1:beg+1] = \
-                                                2*np.pi*freq*n_beg+old_phase
+                                            2*np.pi*freq*n_beg+old_phase
 
             old_phase = self.extrap_phase[:, end].reshape(self.n_harm, 1)
             freq = self.H[:, 2, end].reshape(self.n_harm, 1)
             self.extrap_phase[:, end+1:end+window.N+1] = \
-                                                2*np.pi*freq*n_end+old_phase
+                                            2*np.pi*freq*n_end+old_phase
 
 
 """
@@ -317,7 +332,7 @@ def HM_run(func, signal, pitch, window, samp_jump=None, N_iter=1,
         coef, freq, HM.error[frame] = func(
                                 signal.data[frame-window.N:frame+window.N+1],
                                 f0_ref, window, signal.fs, 20.0, func_options,
-                                N_iter)
+                                N_iter, use_cuda=HM.use_cuda)
 
         # Updates frame parameter values in the 3-dimension storage array H.
         HM.update_values(coef[:signal.n_harm], freq, frame)
@@ -336,14 +351,21 @@ def HM_run(func, signal, pitch, window, samp_jump=None, N_iter=1,
 Core QHM function.
 """
 
-def qhm_iteration(data, f0_ref, window, fs, max_step, freq, N_iter=1):
+def qhm_iteration(data, f0_ref, window, fs, max_step, freq, N_iter=1, 
+                  phase_tech='phase', use_cuda=False):
 
     # Initialize and allocate variables.
     K = len(freq)
     coef = np.zeros((2*K))
 
     E = np.ones((window.length, 2*K), dtype=complex)
-    E = exp_matrix(E, freq, window, K)
+    
+    # Use CUDA implementation if available and requested
+    if use_cuda and _has_cuda and CUDA_AVAILABLE:
+        E = cuda_exp_matrix(E, freq, window, K)
+    else:
+        E = exp_matrix(E, freq, window, K)
+        
     E_windowed = np.ones((window.length, 2*K), dtype=complex)
 
     windowed_data = (window.data*data).reshape(window.length, 1)
@@ -351,7 +373,10 @@ def qhm_iteration(data, f0_ref, window, fs, max_step, freq, N_iter=1):
     # Run the QHM algorithm N_iter times.
     for k in range(N_iter):
         # Calculate the a and b coeficients via least-squares.
-        coef = least_squares(E, E_windowed, windowed_data, window, K)
+        if use_cuda and _has_cuda and CUDA_AVAILABLE:
+            coef = cuda_least_squares(E, E_windowed, windowed_data, window, K)
+        else:
+            coef = least_squares(E, E_windowed, windowed_data, window, K)
 
         # Set a magnitude reference, which is used to detect and supress
         # erroneous magnitude spikes.
@@ -362,10 +387,16 @@ def qhm_iteration(data, f0_ref, window, fs, max_step, freq, N_iter=1):
                                    max_step, fs)
 
         # Updates the complex exponentials matrix.
-        E = exp_matrix(E, freq, window, K)
+        if use_cuda and _has_cuda and CUDA_AVAILABLE:
+            E = cuda_exp_matrix(E, freq, window, K)
+        else:
+            E = exp_matrix(E, freq, window, K)
 
     # Compute the final coefficients values.
-    coef = least_squares(E, E_windowed, windowed_data, window, K)
+    if use_cuda and _has_cuda and CUDA_AVAILABLE:
+        coef = cuda_least_squares(E, E_windowed, windowed_data, window, K)
+    else:
+        coef = least_squares(E, E_windowed, windowed_data, window, K)
 
     # This part is a workaround not present in the original references [1-3].
     # It was created to detect and supress erroneous magnitude spikes, which
@@ -377,10 +408,16 @@ def qhm_iteration(data, f0_ref, window, fs, max_step, freq, N_iter=1):
         freq[~cond] = f0_ref[~cond]
 
         # Updates the complex exponentials matrix with the modified frequencies.
-        E = exp_matrix(E, freq, window, K)
+        if use_cuda and _has_cuda and CUDA_AVAILABLE:
+            E = cuda_exp_matrix(E, freq, window, K)
+        else:
+            E = exp_matrix(E, freq, window, K)
 
         # Recalculate the final coefficients.
-        coef = least_squares(E, E_windowed, windowed_data, window, K)
+        if use_cuda and _has_cuda and CUDA_AVAILABLE:
+            coef = cuda_least_squares(E, E_windowed, windowed_data, window, K)
+        else:
+            coef = least_squares(E, E_windowed, windowed_data, window, K)
 
     # Calculate the mean squared error between the original frame and the
     # synthesized one.
@@ -392,7 +429,7 @@ Core aQHM and eaQHM function.
 """
 
 def aqhm_iteration(data, f0_ref, window, fs, max_step, func_options,
-                   N_iter=1):
+                   N_iter=1, use_cuda=False):
 
     # Initialize and allocate variables.
     previous_HM = func_options[0]
@@ -438,8 +475,12 @@ def aqhm_iteration(data, f0_ref, window, fs, max_step, func_options,
     for k in range(N_iter):
 
         # Calculate the a and b coeficients via least-squares.
-        coef = least_squares(E, E_windowed, windowed_data, window,
-                             previous_HM.n_harm)
+        if use_cuda and _has_cuda and CUDA_AVAILABLE:
+            coef = cuda_least_squares(E, E_windowed, windowed_data, window,
+                                     previous_HM.n_harm)
+        else:
+            coef = least_squares(E, E_windowed, windowed_data, window,
+                               previous_HM.n_harm)
 
         # Updates the frequency values.
         freq, ro = freq_correction(coef[:previous_HM.n_harm],
@@ -450,8 +491,12 @@ def aqhm_iteration(data, f0_ref, window, fs, max_step, func_options,
         E = E*exp_matrix(E_ro, ro/(2*np.pi), window, previous_HM.n_harm)
 
     # Compute the final coefficients values.
-    coef = least_squares(E, E_windowed, windowed_data, window,
-                         previous_HM.n_harm)
+    if use_cuda and _has_cuda and CUDA_AVAILABLE:
+        coef = cuda_least_squares(E, E_windowed, windowed_data, window,
+                                 previous_HM.n_harm)
+    else:
+        coef = least_squares(E, E_windowed, windowed_data, window,
+                           previous_HM.n_harm)
 
     # This part is a workaround not present in the original references [1-3].
     # It was created to detect and supress erroneous magnitude spikes, which
@@ -468,8 +513,12 @@ def aqhm_iteration(data, f0_ref, window, fs, max_step, func_options,
                               previous_HM.n_harm)[:, ~np.append(cond, cond)]
 
         # Recalculate the final coefficients.
-        coef = least_squares(E, E_windowed, windowed_data, window,
-                             previous_HM.n_harm)
+        if use_cuda and _has_cuda and CUDA_AVAILABLE:
+            coef = cuda_least_squares(E, E_windowed, windowed_data, window,
+                                     previous_HM.n_harm)
+        else:
+            coef = least_squares(E, E_windowed, windowed_data, window,
+                               previous_HM.n_harm)
 
     # Calculate the mean squared error between the original frame and the
     # synthsized one.
@@ -576,3 +625,16 @@ def R_eq(delta_f, func, window):
             func(2*np.pi*(delta_f-1./(2*window.N)), window.N)*window.a1 +
             func(2*np.pi*(delta_f+1./window.N), window.N)*window.a2 +
             func(2*np.pi*(delta_f-1./window.N), window.N)*window.a2)
+
+"""
+Check CUDA status
+"""
+def is_cuda_available():
+    """Check if CUDA is available for use with AMFM_decompy."""
+    return CUDA_AVAILABLE
+
+def cuda_info():
+    """Return detailed information about CUDA availability and configuration."""
+    if not _has_cuda:
+        return {"available": False, "reason": "CUDA utilities not imported"}
+    return get_cuda_info()

@@ -37,6 +37,7 @@ urls = { "Homepage" = "https://github.com/bjbschmitt/AMFM_decompy/" }
 
 [project.scripts]
 AMFM_test = "bin.AMFM_test:main"
+AMFM_test2 = "bin.AMFM_cuda_test:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

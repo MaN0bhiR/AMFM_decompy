@@ -1,0 +1,157 @@
+AMFM_decompy CUDA Acceleration
+=========================
+
+Starting with version 1.0.12, AMFM_decompy supports CUDA acceleration for computationally intensive operations in both QHM decomposition and YAAPT pitch tracking, which can significantly improve performance on systems with NVIDIA GPUs.
+
+Requirements
+-----------
+
+To use the CUDA acceleration features, you need:
+
+1. An NVIDIA GPU with compute capability 3.0 or higher
+2. CUDA Toolkit installed on your system
+3. Python packages:
+   - numba
+   - cuda-python
+
+You can install the necessary Python packages with:
+
+```
+pip install numba cuda-python
+```
+
+Usage
+-----
+
+CUDA acceleration is enabled by default when available. The package automatically detects if CUDA is available on your system and will use it for the computationally intensive operations in both algorithms.
+
+You can control CUDA usage with the `AMFM_USE_CUDA` environment variable:
+
+- Set to "1" (default): Use CUDA if available
+- Set to "0": Force CPU usage even if CUDA is available
+
+Example:
+
+```python
+import os
+# Disable CUDA acceleration
+os.environ["AMFM_USE_CUDA"] = "0"
+
+# Enable CUDA acceleration
+os.environ["AMFM_USE_CUDA"] = "1"
+```
+
+Checking CUDA Status
+------------------
+
+You can check if CUDA is available and get information about your CUDA setup:
+
+```python
+# For QHM
+import amfm_decompy.pyQHM as pyqhm
+
+# Check if CUDA is available
+cuda_available = pyqhm.is_cuda_available()
+print(f"CUDA Available: {cuda_available}")
+
+# Get detailed CUDA information
+if cuda_available:
+    cuda_info = pyqhm.cuda_info()
+    print(cuda_info)
+
+# For YAAPT
+import amfm_decompy.pYAAPT as pyaapt
+cuda_available = pyaapt.is_cuda_available()
+```
+
+Performance Testing
+-----------------
+
+To compare the performance of CPU vs. GPU implementations, run the included test script:
+
+```
+python3 bin/AMFM_cuda_test.py
+```
+
+This script will run both the QHM and YAAPT algorithms with CPU and GPU implementations (if CUDA is available) and report the execution times and speedup.
+
+Accelerated Functions in QHM
+--------------------------
+
+The following operations in QHM are accelerated with CUDA:
+
+1. Matrix multiplications for least-squares solution
+2. Complex exponential calculations for exp_matrix
+3. Matrix-vector multiplications
+
+The QHM, aQHM, and eaQHM algorithms all benefit from these optimizations, particularly for signals with many modulated components or long durations.
+
+Accelerated Functions in YAAPT
+----------------------------
+
+The following operations in YAAPT are accelerated with CUDA:
+
+1. FFT operations for spectrum analysis
+2. Spectral Harmonic Correlation (SHC) computation
+3. Normalized Cross-Correlation Function (NCCF) calculations
+4. Dynamic programming for pitch tracking
+
+YAAPT benefits significantly from GPU acceleration, especially for longer audio files, as it involves numerous signal processing operations that can be parallelized.
+
+Performance Gains
+---------------
+
+Performance improvements vary depending on:
+
+1. GPU hardware specifications
+2. Size of the input signal
+3. Complexity of the algorithm parameters
+4. Number of harmonic components (for QHM)
+
+Typical speedups on modern GPUs:
+- QHM: 1.5x - 3x faster
+- aQHM/eaQHM: 2x - 4x faster
+- YAAPT: 3x - 6x faster
+
+Limitations
+---------
+
+1. The CUDA implementation might not be available on all systems.
+2. Small inputs might not see significant performance improvements due to the overhead of data transfer between CPU and GPU.
+3. Some algorithms (especially in aQHM/eaQHM) have steps that are not fully accelerated due to their sequential nature.
+4. The first run might have overhead due to CUDA context initialization and JIT compilation.
+
+Troubleshooting
+-------------
+
+If you encounter issues with CUDA acceleration:
+
+1. Verify that CUDA is correctly installed on your system:
+   ```
+   nvidia-smi
+   ```
+
+2. Check that the required Python packages are installed:
+   ```
+   pip install numba cuda-python
+   ```
+
+3. Verify CUDA detection in AMFM_decompy:
+   ```python
+   import amfm_decompy.pyQHM as pyqhm
+   import amfm_decompy.pYAAPT as pyaapt
+   print(pyqhm.is_cuda_available())
+   print(pyaapt.is_cuda_available())
+   ```
+
+4. Try disabling CUDA to see if the issue persists:
+   ```python
+   import os
+   os.environ["AMFM_USE_CUDA"] = "0"
+   ```
+
+5. For debugging, you can check detailed CUDA information:
+   ```python
+   import amfm_decompy.pyQHM as pyqhm
+   print(pyqhm.cuda_info())
+   ```

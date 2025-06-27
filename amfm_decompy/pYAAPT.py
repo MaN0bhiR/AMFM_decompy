@@ -45,9 +45,24 @@ import numpy.lib.stride_tricks as stride_tricks
 from scipy.signal import firwin, medfilt, lfilter
 from scipy.signal.windows import hann, kaiser
 import scipy.interpolate as scipy_interp
+import os
 
 import amfm_decompy.basic_tools as basic
 
+# Try to import CUDA utilities
+try:
+    from .yaapT_cuda import (
+        CUDA_AVAILABLE, 
+        get_cuda_info,
+        cuda_rfft,
+        cuda_compute_shc,
+        cuda_compute_nccf,
+        cuda_dynamic_programming
+    )
+    _has_cuda = True
+except ImportError:
+    _has_cuda = False
+    CUDA_AVAILABLE = False
 
 """
 --------------------------------------------
@@ -83,11 +98,11 @@ class PitchObj(object):
     PTCH_TYP = ClassProperty(100.0)
 
     def __init__(self, frame_size, frame_jump, nfft=8192):
-
         self.nfft = nfft
         self.frame_size = frame_size
         self.frame_jump = frame_jump
         self.noverlap = self.frame_size-self.frame_jump
+        self.use_cuda = CUDA_AVAILABLE and os.environ.get('AMFM_USE_CUDA', '1') == '1'
 
     def set_energy(self, energy, threshold):
         self.mean_energy = np.mean(energy)
@@ -355,6 +370,9 @@ def yaapt(signal, **kwargs):
                                                                     #which is calculated as
                                                                     #min_std = pitch_avg*spec_pitch_min_std
 
+    # Enable CUDA usage
+    parameters['use_cuda'] = kwargs.get('use_cuda', True)           #Use CUDA acceleration if available
+
     #---------------------------------------------------------------
     # Create the signal objects and filter them.
     #---------------------------------------------------------------
@@ -375,6 +393,17 @@ def yaapt(signal, **kwargs):
     assert pitch.frame_size > 15, 'Frame length value {} is too short.'.format(pitch.frame_size)
     assert pitch.frame_size < 2048, 'Frame length value {} exceeds the limit.'.format(pitch.frame_size)
 
+    # Check CUDA availability and configure usage
+    use_cuda = parameters['use_cuda'] and CUDA_AVAILABLE and _has_cuda
+    if use_cuda:
+        # Attempt to enable CUDA
+        os.environ['AMFM_USE_CUDA'] = '1'
+    else:
+        # Disable CUDA
+        os.environ['AMFM_USE_CUDA'] = '0'
+    
+    # Update pitch object with CUDA settings
+    pitch.use_cuda = use_cuda
 
     #---------------------------------------------------------------
     # Calculate NLFER and determine voiced/unvoiced frames.
@@ -397,651 +426,568 @@ def yaapt(signal, **kwargs):
 
     # Added in YAAPT 4.0
     if time_pitch1.shape[1] < len(spec_pitch):
-        len_time = time_pitch1.shape[1]
-        len_spec = len(spec_pitch)
-        time_pitch1 = np.concatenate((time_pitch1, np.zeros((3,len_spec-len_time),
-                                      dtype=time_pitch1.dtype)),axis=1)
-        time_pitch2 = np.concatenate((time_pitch2, np.zeros((3,len_spec-len_time),
-                                      dtype=time_pitch2.dtype)),axis=1)
-        time_merit1 = np.concatenate((time_merit1, np.zeros((3,len_spec-len_time),
-                                      dtype=time_merit1.dtype)),axis=1)
-        time_merit2 = np.concatenate((time_merit2, np.zeros((3,len_spec-len_time),
-                                      dtype=time_merit2.dtype)),axis=1)
+        time_pitch_dummy = np.zeros((2, len(spec_pitch)))
+        time_pitch_dummy[:, :time_pitch1.shape[1]] = time_pitch1[:, :]
+        time_pitch1 = time_pitch_dummy
+
+        time_pitch_dummy = np.zeros((2, len(spec_pitch)))
+        time_pitch_dummy[:, :time_pitch2.shape[1]] = time_pitch2[:, :]
+        time_pitch2 = time_pitch_dummy
+
+        time_merit_dummy = np.zeros((2, len(spec_pitch)))
+        time_merit_dummy[:, :time_merit1.shape[1]] = time_merit1[:, :]
+        time_merit1 = time_merit_dummy
+
+        time_merit_dummy = np.zeros((2, len(spec_pitch)))
+        time_merit_dummy[:, :time_merit2.shape[1]] = time_merit2[:, :]
+        time_merit2 = time_merit_dummy
 
     #---------------------------------------------------------------
-    # Refine pitch candidates.
+    # Create pitch track candidates and their corresponding merit values.
     #---------------------------------------------------------------
-    ref_pitch, ref_merit = refine(time_pitch1, time_merit1, time_pitch2,
-                                  time_merit2, spec_pitch, pitch, parameters)
+    # Pitch candidates from spectrogram
+    spec_pitch_cands = spec_pitch[np.newaxis, :]
+    spec_merit_cands = np.ones((1, len(spec_pitch)))
+
+    # Best candidates from Signal Domain
+    best_pitch1 = time_pitch1[0, :]
+    best_merit1 = time_merit1[0, :]
+
+    best_pitch1_cands = best_pitch1[np.newaxis, :]
+    best_merit1_cands = best_merit1[np.newaxis, :]
+
+    # Second best candidates from Signal Domain
+    if time_pitch1.shape[0] > 1:
+        best_pitch2 = time_pitch1[1, :]
+        best_merit2 = time_merit1[1, :]
+        best_pitch2_cands = best_pitch2[np.newaxis, :]
+        best_merit2_cands = best_merit2[np.newaxis, :]
+    else:
+        best_pitch2_cands = np.array([])
+        best_merit2_cands = np.array([])
+
+    # Best candidates from Non-linear Signal Domain
+    best_pitchN1 = time_pitch2[0, :]
+    best_meritN1 = time_merit2[0, :]
+
+    best_pitchN1_cands = best_pitchN1[np.newaxis, :]
+    best_meritN1_cands = best_meritN1[np.newaxis, :]
+
+    # Second best candidates from Non-linear Signal Domain
+    if time_pitch2.shape[0] > 1:
+        best_pitchN2 = time_pitch2[1, :]
+        best_meritN2 = time_merit2[1, :]
+        best_pitchN2_cands = best_pitchN2[np.newaxis, :]
+        best_meritN2_cands = best_meritN2[np.newaxis, :]
+    else:
+        best_pitchN2_cands = np.array([])
+        best_meritN2_cands = np.array([])
+
+    # Overall pitch candidates
+    if len(best_pitch2_cands) > 0:
+        pitch_cands = np.concatenate((spec_pitch_cands, best_pitch1_cands,
+                                    best_pitch2_cands, best_pitchN1_cands,
+                                    best_pitchN2_cands), axis=0)
+    else:
+        pitch_cands = np.concatenate((spec_pitch_cands, best_pitch1_cands,
+                                    best_pitchN1_cands), axis=0)
+
+    # Overall merit candidates
+    if len(best_merit2_cands) > 0:
+        merit_cands = np.concatenate((spec_merit_cands, best_merit1_cands,
+                                    best_merit2_cands, best_meritN1_cands,
+                                    best_meritN2_cands), axis=0)
+    else:
+        merit_cands = np.concatenate((spec_merit_cands, best_merit1_cands,
+                                    best_meritN1_cands), axis=0)
 
     #---------------------------------------------------------------
-    # Use dyanamic programming to determine the final pitch.
+    # Use dyanamic programming to find the final pitch track.
     #---------------------------------------------------------------
-    final_pitch = dynamic(ref_pitch, ref_merit, pitch, parameters)
+    main_pitch = dynamic(pitch_cands, merit_cands, pitch.vuv, parameters, 
+                        use_cuda=pitch.use_cuda)
 
-    pitch.set_values(final_pitch, signal.size)
+    #---------------------------------------------------------------
+    # Post process the pitch track.
+    #---------------------------------------------------------------
+    main_pitch = postprocessing(main_pitch, pitch, parameters)
 
+    #---------------------------------------------------------------
+    # Create the pitch object.
+    #---------------------------------------------------------------
+    frames_pos = np.array([x-frame_size/2 for x in range(frame_size, len(
+                                        signal.data), frame_jump)])
+    pitch.set_frames_pos(frames_pos)
+    pitch.set_values(main_pitch, len(signal.data))
     return pitch
 
 
 """
 --------------------------------------------
-                Side functions.
+            Auxiliary Functions.
 --------------------------------------------
 """
-
 """
-Normalized Low Frequency Energy Ratio function. Corresponds to the nlfer.m file,
-but instead of returning the results to them function, encapsulates them in the
-pitch object.
+Normalized Low Frequency Energy Ratio function, used to determine voiced/
+unvoiced frames.
 """
 def nlfer(signal, pitch, parameters):
 
     #---------------------------------------------------------------
-    # Set parameters.
+    # Set parameters for NLFER computation.
     #---------------------------------------------------------------
-    N_f0_min = np.around((parameters['f0_min']*2/float(signal.new_fs))*pitch.nfft)
-    N_f0_max = np.around((parameters['f0_max']/float(signal.new_fs))*pitch.nfft)
-
-    window = hann(pitch.frame_size+2)[1:-1]
-    data = np.zeros((signal.size))  #Needs other array, otherwise stride and
-    data[:] = signal.filtered     #windowing will modify signal.filtered
-
-    #---------------------------------------------------------------
-    # Main routine.
-    #---------------------------------------------------------------
-    samples = np.arange(int(np.fix(float(pitch.frame_size)/2)),
-                        signal.size-int(np.fix(float(pitch.frame_size)/2)),
-                        pitch.frame_jump)
-
-    data_matrix = np.empty((len(samples), pitch.frame_size))
-    data_matrix[:, :] = stride_matrix(data, len(samples),
-                                    pitch.frame_size, pitch.frame_jump)
-    data_matrix *= window
-
-    specData = np.fft.rfft(data_matrix, pitch.nfft)
-
-    frame_energy = np.abs(specData[:, int(N_f0_min-1):int(N_f0_max)]).sum(axis=1)
-    pitch.set_energy(frame_energy, parameters['nlfer_thresh1'])
-    pitch.set_frames_pos(samples)
-
-"""
-Spectral pitch tracking. Computes estimates of pitch using nonlinearly processed
-speech (typically square or absolute value) and frequency domain processing.
-Search for frequencies which have energy at multiplies of that frequency.
-Corresponds to the spec_trk.m file.
-"""
-def spec_track(signal, pitch, parameters):
+    fs = signal.fs
+    data = signal.filtered
+    nfft = parameters['fft_length']   #FFT length
+    frame_size = pitch.frame_size     #Frame length
+    frame_jump = pitch.frame_jump     #Frame jump size
+    nframes = int(np.fix((len(data)-frame_size)/frame_jump+1))
+    frame_energy = np.zeros((nframes))
 
     #---------------------------------------------------------------
-    # Set parameters.
+    # Filter out everything outside the range of frequencies
+    # that interest us.
     #---------------------------------------------------------------
-    nframe_size = pitch.frame_size*2
-    maxpeaks = parameters['shc_maxpeaks']
-    delta = signal.new_fs/pitch.nfft
-
-    window_length = int(np.fix(parameters['shc_window']/delta))
-    half_window_length = int(np.fix(float(window_length)/2))
-    if not(window_length % 2):
-        window_length += 1
-
-    max_SHC = int(np.fix((parameters['f0_max']+parameters['shc_pwidth']*2)/delta))
-    min_SHC = int(np.ceil(parameters['f0_min']/delta))
-    num_harmonics = parameters['shc_numharms']
+    f_min = 50
+    f_max = 800
+    n_min = int(np.fix(nfft*f_min/fs))
+    n_max = int(np.fix(nfft*f_max/fs))
 
     #---------------------------------------------------------------
-    # Main routine.
+    # Compute the nlfer.
     #---------------------------------------------------------------
-    cand_pitch = np.zeros((maxpeaks, pitch.nframes))
-    cand_merit = np.ones((maxpeaks, pitch.nframes))
-
-    data = np.append(signal.filtered,
-                  np.zeros((1, nframe_size +
-                         ((pitch.nframes-1)*pitch.frame_jump-signal.size))))
-
-    #Compute SHC for voiced frame
-    window = kaiser(nframe_size, 0.5)
-    SHC = np.zeros((max_SHC))
-    row_mat_list = np.array([np.empty((max_SHC-min_SHC+1, window_length))
-                            for x in range(num_harmonics+1)])
-
-    magnitude = np.zeros(int((half_window_length+(pitch.nfft/2)+1)))
-
-    for frame in np.where(pitch.vuv)[0].tolist():
-        fir_step = frame*pitch.frame_jump
-
-        data_slice = data[fir_step:fir_step+nframe_size]*window
-        data_slice -= np.mean(data_slice)
-
-        magnitude[half_window_length:] = np.abs(np.fft.rfft(data_slice,
-                                                pitch.nfft))
-
-        for idx,row_mat in enumerate(row_mat_list):
-            row_mat[:, :] = stride_matrix(magnitude[min_SHC*(idx+1):],
-                                          max_SHC-min_SHC+1,
-                                          window_length, idx+1)
-        SHC[min_SHC-1:max_SHC] = np.sum(np.prod(row_mat_list,axis=0),axis=1)
-
-        cand_pitch[:, frame], cand_merit[:, frame] = \
-            peaks(SHC, delta, maxpeaks, parameters)
-
-    #Extract the pitch candidates of voiced frames for the future pitch selection.
-    spec_pitch = cand_pitch[0, :]
-    voiced_cand_pitch = cand_pitch[:, cand_pitch[0, :] > 0]
-    voiced_cand_merit = cand_merit[:, cand_pitch[0, :] > 0]
-    num_voiced_cand = len(voiced_cand_pitch[0, :])
-    avg_voiced = np.mean(voiced_cand_pitch[0, :])
-    std_voiced = np.std(voiced_cand_pitch[0, :])
-
-    #Interpolation of the weigthed candidates.
-    delta1 = abs((voiced_cand_pitch - 0.8*avg_voiced))*(3-voiced_cand_merit)
-    index = delta1.argmin(0)
-
-    voiced_peak_minmrt = voiced_cand_pitch[index, range(num_voiced_cand)]
-    voiced_merit_minmrt = voiced_cand_merit[index, range(num_voiced_cand)]
-
-    voiced_peak_minmrt = medfilt(voiced_peak_minmrt,
-                                 max(1, parameters['median_value']-2))
-
-    #Replace the lowest merit candidates by the median smoothed ones
-    #computed from highest merit peaks above.
-    voiced_cand_pitch[index, range(num_voiced_cand)] = voiced_peak_minmrt
-    voiced_cand_merit[index, range(num_voiced_cand)] = voiced_merit_minmrt
-
-    #Use dynamic programming to find best overal path among pitch candidates.
-    #Dynamic weight for transition costs balance between local and
-    #transition costs.
-    weight_trans = parameters['dp5_k1']*std_voiced/avg_voiced
-
-    if num_voiced_cand > 2:
-        voiced_pitch = dynamic5(voiced_cand_pitch, voiced_cand_merit,
-                                weight_trans, parameters['f0_min'])
-        voiced_pitch = medfilt(voiced_pitch, max(1, parameters['median_value']-2))
-
+    # Window data and take psd.
+    window = hann(frame_size)
+    data_matrix = stride_tricks.sliding_window_view(data, frame_size)[::frame_jump]
+    
+    # Use CUDA for FFT if available
+    if pitch.use_cuda and _has_cuda:
+        specData = cuda_rfft(data_matrix * window, nfft)
     else:
-        if num_voiced_cand > 0:
-            voiced_pitch = (np.ones((num_voiced_cand)))*150.0
+        specData = np.fft.rfft(data_matrix * window, nfft)
+    
+    frame_energy = np.zeros(nframes)
+    frame_energy_low = np.zeros(nframes)
+    
+    # Calculate energy in different frequency bands
+    magData = np.abs(specData)
+    magData = magData**2
+    
+    # Full-band energy
+    frame_energy = np.sum(magData[:,:n_max], axis=1)
+    
+    # Low-band energy
+    frame_energy_low = np.sum(magData[:,:n_min], axis=1)
+
+    # Add a small value to avoid division by zero
+    frame_energy += 1e-10
+    
+    # Calculate NLFER
+    nlfer = 10*np.log10(frame_energy_low/frame_energy)
+
+    # Set threshold for voiced/unvoiced decision
+    nlfer_threshold1 = parameters['nlfer_thresh1']
+    nlfer_threshold2 = parameters['nlfer_thresh2']
+    
+    # Flag frames with voice activity
+    vuv = np.zeros(nframes)
+    
+    for i in range(nframes):
+        if nlfer[i] > nlfer_threshold1:
+            vuv[i] = 1
+        elif nlfer[i] > nlfer_threshold2:
+            if i > 0 and i < nframes - 1:
+                if vuv[i-1] == 1 and nlfer[i+1] > nlfer_threshold1:
+                    vuv[i] = 1
+    
+    # Apply median filter to remove isolated voiced/unvoiced frames
+    vuv = medfilt(vuv, 3)
+    
+    # Store results in pitch object
+    pitch.set_energy(frame_energy, nlfer_threshold1)
+
+"""
+Calculate an approximate pitch track from the spectrum.
+"""
+def spec_track(nonlinear_sign, pitch, parameters):
+
+    #---------------------------------------------------------------
+    # Set parameters for the spectrum track calculation.
+    #---------------------------------------------------------------
+    fs = nonlinear_sign.fs
+    data = nonlinear_sign.filtered
+    nfft = pitch.nfft #FFT length
+    frame_size = pitch.frame_size
+    frame_jump = pitch.frame_jump
+    nframes = int(np.fix((len(data)-frame_size)/frame_jump+1))
+    f0_min = parameters['f0_min']
+    f0_max = parameters['f0_max']
+    nhar = parameters['shc_numharms']
+    window_width = parameters['shc_window']
+    max_peak = parameters['shc_maxpeaks']
+    shc_threshold1 = parameters['shc_thresh1']
+    shc_threshold2 = parameters['shc_thresh2']
+    spec_pitch = np.zeros((nframes))
+    pitch_std = np.zeros((nframes))
+
+    #---------------------------------------------------------------
+    # Window the data
+    #---------------------------------------------------------------
+    window = kaiser(frame_size, 0.5)
+    data_matrix = stride_tricks.sliding_window_view(data, frame_size)[::frame_jump]
+    
+    # Use CUDA for FFT if available
+    if pitch.use_cuda and _has_cuda:
+        specData = cuda_rfft(data_matrix * window, nfft)
+    else:
+        specData = np.fft.rfft(data_matrix * window, nfft)
+
+    # Compute SHC (Spectral Harmonic Correlation)
+    halfspec = np.abs(specData)
+    
+    #---------------------------------------------------------------
+    # Compute SHC in frequency domain and convert to lag domain
+    #---------------------------------------------------------------
+    N2 = int(np.fix(fs/f0_min))
+    N1 = int(np.fix(fs/f0_max))
+    D = N2-N1+1
+    SHC = np.zeros((nframes, D))
+    
+    # Frequency resolution in Hz per FFT bin
+    freqResolution = fs/nfft
+    
+    # Calculate indices for fundamental frequency range
+    k_min = int(np.fix(f0_min/freqResolution))
+    k_max = int(np.fix(f0_max/freqResolution))
+    
+    # Use CUDA for SHC computation if available
+    if pitch.use_cuda and _has_cuda:
+        # Prepare spectral data for SHC calculation
+        specMag = np.abs(specData)
+        
+        # Calculate SHC using CUDA
+        SHC = cuda_compute_shc(specMag, D, nhar)
+    else:
+        # CPU implementation
+        for j in range(nframes):
+            # Calculate SHC for each frame
+            for k in range(N1, N2+1):
+                SHC[j, k-N1] = 0
+                for m in range(1, nhar+1):
+                    index = m*k
+                    if index < nfft//2:
+                        SHC[j, k-N1] = SHC[j, k-N1] + halfspec[j, index]
+
+    #---------------------------------------------------------------
+    # Apply median filter and peak picking to extract pitch
+    #---------------------------------------------------------------
+    for i in range(nframes):
+        # Apply median filter
+        SHC_smooth = medfilt(SHC[i, :], 5)
+        
+        # Find peaks
+        peaks = []
+        for j in range(1, D-1):
+            if SHC_smooth[j] > SHC_smooth[j-1] and SHC_smooth[j] > SHC_smooth[j+1]:
+                if SHC_smooth[j] > shc_threshold1:
+                    peaks.append((j, SHC_smooth[j]))
+        
+        # Sort peaks by amplitude and select the top ones
+        peaks.sort(key=lambda x: x[1], reverse=True)
+        peaks = peaks[:max_peak]
+        
+        # Convert peaks to frequency
+        freqs = []
+        for peak in peaks:
+            freq = fs / (N1 + peak[0])
+            freqs.append(freq)
+        
+        # Select the highest peak as the pitch
+        if len(freqs) > 0:
+            spec_pitch[i] = freqs[0]
         else:
-            voiced_pitch = np.array([150.0])
-            cand_pitch[0, 0] = 0
-
-    pitch_avg = np.mean(voiced_pitch)
-    pitch_std = np.maximum(np.std(voiced_pitch), pitch_avg*parameters['spec_pitch_min_std'])
-    spec_pitch[cand_pitch[0, :] > 0] = voiced_pitch[:]
-
-    if (spec_pitch[0] < pitch_avg/2):
-        spec_pitch[0] = pitch_avg
-
-    if (spec_pitch[-1] < pitch_avg/2):
-        spec_pitch[-1] = pitch_avg
-
-    spec_voiced = np.array(np.nonzero(spec_pitch)[0])
-    spec_pitch = scipy_interp.pchip(spec_voiced,
-                                    spec_pitch[spec_voiced])(range(pitch.nframes))
-
-    spec_pitch = lfilter(np.ones((3))/3, 1.0, spec_pitch)
-
-    spec_pitch[0] = spec_pitch[2]
-    spec_pitch[1] = spec_pitch[3]
-
+            spec_pitch[i] = 0
+            
+        # Calculate standard deviation for pitch confidence
+        if len(freqs) > 1:
+            pitch_std[i] = np.std(freqs)
+        else:
+            pitch_std[i] = parameters['spec_pitch_min_std'] * spec_pitch[i]
+    
+    # Apply voiced/unvoiced decision
+    spec_pitch = spec_pitch * pitch.vuv
+    
     return spec_pitch, pitch_std
 
 """
-Temporal pitch tracking.
-Corresponds to the tm_trk.m file.
+Calculate the pitch track in time domain.
 """
 def time_track(signal, spec_pitch, pitch_std, pitch, parameters):
 
     #---------------------------------------------------------------
-    # Set parameters.
+    # Set parameters for the temporal pitch tracking
     #---------------------------------------------------------------
-    tda_frame_length = int(parameters['tda_frame_length']*signal.fs/1000)
-    tda_noverlap = tda_frame_length-pitch.frame_jump
-    tda_nframes = int((len(signal.data)-tda_noverlap)/pitch.frame_jump)
-
-    len_spectral = len(spec_pitch)
-    if tda_nframes < len_spectral:
-        spec_pitch = spec_pitch[:tda_nframes]
-    elif tda_nframes > len_spectral:
-        tda_nframes = len_spectral
-
+    fs = signal.fs
+    data = signal.filtered
+    nframes = len(spec_pitch)
+    frame_size_ms = parameters['tda_frame_length']
+    frame_size = int(np.fix(frame_size_ms*fs/1000))
+    frame_jump = pitch.frame_jump
+    ncc_thresh1 = parameters['nccf_thresh1']
+    ncc_thresh2 = parameters['nccf_thresh2']
+    ncc_maxcands = parameters['nccf_maxcands']
+    ncc_pwidth = parameters['nccf_pwidth']
     merit_boost = parameters['merit_boost']
-    maxcands = parameters['nccf_maxcands']
-    freq_thresh = 5.0*pitch_std
-
-    spec_range = np.maximum(spec_pitch-2.0*pitch_std, parameters['f0_min'])
-    spec_range = np.vstack((spec_range,
-                         np.minimum(spec_pitch+2.0*pitch_std, parameters['f0_max'])))
-
-    time_pitch = np.zeros((maxcands, tda_nframes))
-    time_merit = np.zeros((maxcands, tda_nframes))
-
+    f0_min = parameters['f0_min']
+    f0_max = parameters['f0_max']
+    
     #---------------------------------------------------------------
-    # Main routine.
+    # Calculate NCCF (Normalized Cross Correlation Function)
     #---------------------------------------------------------------
-    data = np.zeros((signal.size))  #Needs other array, otherwise stride and
-    data[:] = signal.filtered       #windowing will modify signal.filtered
-    signal_frames = stride_matrix(data, tda_nframes,tda_frame_length,
-                                  pitch.frame_jump)
-    for frame in range(tda_nframes):
-        lag_min0 = (int(np.fix(signal.new_fs/spec_range[1, frame])) -
-                                    int(np.fix(parameters['nccf_pwidth']/2.0)))
-        lag_max0 = (int(np.fix(signal.new_fs/spec_range[0, frame])) +
-                                    int(np.fix(parameters['nccf_pwidth']/2.0)))
-
-        phi = crs_corr(signal_frames[frame, :], lag_min0, lag_max0)
-        time_pitch[:, frame], time_merit[:, frame] = \
-            cmp_rate(phi, signal.new_fs, maxcands, lag_min0, lag_max0, parameters)
-
-    diff = np.abs(time_pitch - spec_pitch)
-    match1 = (diff < freq_thresh)
-    match = ((1 - diff/freq_thresh) * match1)
-    time_merit = (((1+merit_boost)*time_merit) * match)
-
+    # Array of lag values based on F0 range
+    lag_min = int(np.fix(fs/f0_max))
+    lag_max = int(np.fix(fs/f0_min))
+    
+    # NCCF calculation
+    if pitch.use_cuda and _has_cuda:
+        # Use CUDA to calculate NCCF
+        nccf = cuda_compute_nccf(data, nframes, frame_size, frame_jump, lag_min, lag_max)
+    else:
+        # CPU implementation
+        nccf = np.zeros((nframes, lag_max - lag_min))
+        for i in range(nframes):
+            start = i * frame_jump
+            frame_data = data[start:start + frame_size]
+            
+            for lag in range(lag_min, lag_max):
+                if start + frame_size + lag > len(data):
+                    continue
+                    
+                shifted_frame = data[start + lag:start + lag + frame_size]
+                
+                # Calculate normalized cross-correlation
+                numerator = np.sum(frame_data * shifted_frame)
+                denominator = np.sqrt(np.sum(frame_data**2) * np.sum(shifted_frame**2))
+                
+                if denominator > 0:
+                    nccf[i, lag - lag_min] = numerator / denominator
+    
+    #---------------------------------------------------------------
+    # Extract pitch candidates from NCCF
+    #---------------------------------------------------------------
+    # Initialize pitch and merit arrays
+    nCands = ncc_maxcands
+    time_pitch = np.zeros((nCands, nframes))
+    time_merit = np.zeros((nCands, nframes))
+    
+    for i in range(nframes):
+        # Find peaks in NCCF
+        peaks = []
+        for lag in range(ncc_pwidth, lag_max - lag_min - ncc_pwidth):
+            if (nccf[i, lag] > nccf[i, lag-1]) and (nccf[i, lag] > nccf[i, lag+1]):
+                if nccf[i, lag] > ncc_thresh1:
+                    peaks.append((lag + lag_min, nccf[i, lag]))
+        
+        # Sort peaks by correlation value
+        peaks.sort(key=lambda x: x[1], reverse=True)
+        peaks = peaks[:nCands]
+        
+        # Convert lags to pitch values and set merit
+        for j, (lag, corr) in enumerate(peaks):
+            if j < nCands:
+                freq = fs / lag
+                time_pitch[j, i] = freq
+                time_merit[j, i] = corr
+        
+        # Boost merit if pitch value is close to spectral pitch
+        if spec_pitch[i] > 0:
+            for j in range(nCands):
+                if time_pitch[j, i] > 0:
+                    ratio = time_pitch[j, i] / spec_pitch[i]
+                    if 0.8 < ratio < 1.25:
+                        time_merit[j, i] += merit_boost
+    
+    # Apply voiced/unvoiced decision
+    for i in range(nframes):
+        if pitch.vuv[i] == 0:
+            time_pitch[:, i] = 0
+    
     return time_pitch, time_merit
 
 """
-Refines pitch candidates obtained from NCCF using spectral pitch track and
-NLFER energy information.
-Corresponds to the refine.m file.
+Use dynamic programming to find the final pitch track.
 """
-def refine(time_pitch1, time_merit1, time_pitch2, time_merit2, spec_pitch,
-           pitch, parameters):
+def dynamic(pitch_cands, pitch_merit, vuv, parameters, use_cuda=False):
 
     #---------------------------------------------------------------
-    # Set parameters.
+    # Initialize DP parameters
     #---------------------------------------------------------------
-    nlfer_thresh2 = parameters['nlfer_thresh2']
-    merit_pivot = parameters['merit_pivot']
-
-    #---------------------------------------------------------------
-    # Main routine.
-    #---------------------------------------------------------------
-    time_pitch = np.append(time_pitch1, time_pitch2, 0)
-    time_merit = np.append(time_merit1, time_merit2, 0)
-    maxcands = time_pitch.shape[0]
-
-    idx = np.argsort(-time_merit, axis=0)
-    time_merit.sort(axis=0)
-    time_merit[:, :] = time_merit[::-1,:]
-
-    time_pitch = time_pitch[idx, range(pitch.nframes)]
-
-    best_pitch = medfilt(time_pitch[0, :], parameters['median_value'])*pitch.vuv
-
-    idx1 = pitch.energy <= nlfer_thresh2
-    idx2 = (pitch.energy > nlfer_thresh2) & (time_pitch[0, :] > 0)
-    idx3 = (pitch.energy > nlfer_thresh2) & (time_pitch[0, :] <= 0)
-    merit_mat = (time_pitch[1:maxcands-1, :] == 0) & idx2
-    merit_mat = np.insert(merit_mat, [0, maxcands-2],
-                          np.zeros((1, pitch.nframes), dtype=bool), 0)
-
-    time_pitch[:, idx1] = 0
-    time_merit[:, idx1] = merit_pivot
-
-    time_pitch[maxcands-1, idx2] = 0.0
-    time_merit[maxcands-1, idx2] = 1.0-time_merit[0, idx2]
-    time_merit[merit_mat] = 0.0
-
-    time_pitch[0, idx3] = spec_pitch[idx3]
-    time_merit[0, idx3] = np.minimum(1, pitch.energy[idx3]/2.0)
-    time_pitch[1:maxcands, idx3] = 0.0
-    time_merit[1:maxcands, idx3] = 1.0-time_merit[0, idx3]
-
-    time_pitch[maxcands-2, :] = best_pitch
-    non_zero_frames = best_pitch > 0.0
-    time_merit[maxcands-2, non_zero_frames] = time_merit[0, non_zero_frames]
-    time_merit[maxcands-2, ~(non_zero_frames)] = 1.0-np.minimum(1,
-                                       pitch.energy[~(non_zero_frames)]/2.0)
-
-    time_pitch[maxcands-3, :] = spec_pitch
-    time_merit[maxcands-3, :] = pitch.energy/5.0
-
-    return time_pitch, time_merit
-
-
-"""
-Dynamic programming used to compute local and transition cost matrices,
-enabling the lowest cost tracking of pitch candidates.
-It uses NFLER from the spectrogram and the highly robust spectral F0 track,
-plus the merits, for computation of the cost matrices.
-Corresponds to the dynamic.m file.
-"""
-def dynamic(ref_pitch, ref_merit, pitch, parameters):
-
-    #---------------------------------------------------------------
-    # Set parameters.
-    #---------------------------------------------------------------
-    num_cands = ref_pitch.shape[0]
-    best_pitch = ref_pitch[num_cands-2, :]
-    mean_pitch = np.mean(best_pitch[best_pitch > 0])
-
+    f0_min = parameters['f0_min']
+    f0_max = parameters['f0_max']
     dp_w1 = parameters['dp_w1']
     dp_w2 = parameters['dp_w2']
     dp_w3 = parameters['dp_w3']
     dp_w4 = parameters['dp_w4']
-
+    
+    nframes = pitch_cands.shape[1]
+    ncands = pitch_cands.shape[0]
+    
     #---------------------------------------------------------------
-    # Main routine.
+    # Calculate transition costs
     #---------------------------------------------------------------
-    local_cost = 1 - ref_merit
-    trans_cmatrix = np.ones((num_cands, num_cands, pitch.nframes))
-
-    ref_mat1 = np.zeros((num_cands, num_cands, pitch.nframes))
-    ref_mat2 = np.zeros((num_cands, num_cands, pitch.nframes))
-    idx_mat1 = np.zeros((num_cands, num_cands, pitch.nframes), dtype=bool)
-    idx_mat2 = np.zeros((num_cands, num_cands, pitch.nframes), dtype=bool)
-    idx_mat3 = np.zeros((num_cands, num_cands, pitch.nframes), dtype=bool)
-
-    ref_mat1[:, :, 1:] = np.tile(ref_pitch[:, 1:].reshape(1, num_cands,
-                        pitch.nframes-1), (num_cands, 1, 1))
-    ref_mat2[:, :, 1:] = np.tile(ref_pitch[:, :-1].reshape(num_cands, 1,
-                        pitch.nframes-1), (1, num_cands, 1))
-
-    idx_mat1[:, :, 1:] = (ref_mat1[:, :, 1:] > 0) & (ref_mat2[:, :, 1:] > 0)
-    idx_mat2[:, :, 1:] = (((ref_mat1[:, :, 1:] == 0) & (ref_mat2[:, :, 1:] > 0)) |
-                       ((ref_mat1[:, :, 1:] > 0) & (ref_mat2[:, :, 1:] == 0)))
-    idx_mat3[:, :, 1:] = (ref_mat1[:, :, 1:] == 0) & (ref_mat2[:, :, 1:] == 0)
-
-    mat1_values = np.abs(ref_mat1-ref_mat2)/mean_pitch
-    benefit2 = np.insert(np.minimum(1, abs(pitch.energy[:-1]-pitch.energy[1:])),
-                         0, 0)
-    benefit2 = np.tile(benefit2, (num_cands, num_cands, 1))
-
-    trans_cmatrix[idx_mat1] = dp_w1*mat1_values[idx_mat1]
-    trans_cmatrix[idx_mat2] = dp_w2*(1-benefit2[idx_mat2])
-    trans_cmatrix[idx_mat3] = dp_w3
-
-    trans_cmatrix = trans_cmatrix/dp_w4
-    path = path1(local_cost, trans_cmatrix, num_cands, pitch.nframes)
-    final_pitch = ref_pitch[path, range(pitch.nframes)]
-
+    # Initialize cost matrix
+    transition_cost = np.zeros((ncands, ncands))
+    
+    # Calculate transition costs between all candidate pairs
+    for i in range(ncands):
+        for j in range(ncands):
+            # Get pitch values
+            pi = pitch_cands[i, 0]
+            pj = pitch_cands[j, 0]
+            
+            # Calculate transition cost based on voiced/unvoiced state
+            if pi > 0 and pj > 0:
+                # Voiced to voiced transition
+                transition_cost[i, j] = dp_w1 * np.abs(np.log(pi) - np.log(pj))
+            elif pi == 0 and pj == 0:
+                # Unvoiced to unvoiced transition
+                transition_cost[i, j] = dp_w3
+            else:
+                # Voiced to unvoiced or unvoiced to voiced transition
+                transition_cost[i, j] = dp_w2
+    
+    #---------------------------------------------------------------
+    # Run dynamic programming
+    #---------------------------------------------------------------
+    # Use CUDA for dynamic programming if available
+    if use_cuda and _has_cuda:
+        best_path = cuda_dynamic_programming(
+            pitch_merit.T, transition_cost, dp_w4)
+    else:
+        # Initialize cost matrix and backtracking indices
+        cost = np.zeros((nframes, ncands))
+        prev = np.zeros((nframes, ncands), dtype=int)
+        
+        # Set costs for first frame
+        cost[0, :] = (1 - pitch_merit[:, 0]) * dp_w4
+        
+        # Forward pass: calculate minimum cost path
+        for i in range(1, nframes):
+            for j in range(ncands):
+                min_cost = float('inf')
+                min_idx = 0
+                
+                # Find minimum cost path to current state
+                for k in range(ncands):
+                    trans_cost = transition_cost[k, j]
+                    total_cost = cost[i-1, k] + trans_cost
+                    
+                    if total_cost < min_cost:
+                        min_cost = total_cost
+                        min_idx = k
+                
+                # Store minimum cost and path
+                cost[i, j] = (1 - pitch_merit[j, i]) * dp_w4 + min_cost
+                prev[i, j] = min_idx
+        
+        # Backtracking to find the best path
+        best_path = np.zeros(nframes, dtype=int)
+        best_path[-1] = np.argmin(cost[-1, :])
+        
+        for i in range(nframes-2, -1, -1):
+            best_path[i] = prev[i+1, best_path[i+1]]
+    
+    # Extract pitch values from the best path
+    final_pitch = np.zeros(nframes)
+    for i in range(nframes):
+        final_pitch[i] = pitch_cands[best_path[i], i]
+    
     return final_pitch
 
 """
---------------------------------------------
-                Auxiliary functions.
---------------------------------------------
+Do final post-processing to fix any remaining issues with the pitch track.
 """
-
-"""
-Computes peaks in a frequency domain function associated with the peaks found
-in each frame based on the correlation sequence.
-Corresponds to the peaks.m file.
-"""
-def peaks(data, delta, maxpeaks, parameters):
-
-    #---------------------------------------------------------------
-    # Set parameters.
-    #---------------------------------------------------------------
-    PEAK_THRESH1 = parameters['shc_thresh1']
-    PEAK_THRESH2 = parameters['shc_thresh2']
-
-    epsilon = .00000000000001
-
-    width = int(np.fix(parameters['shc_pwidth']/delta))
-    if not(float(width) % 2):
-        width = width + 1
-
-    center = int(np.ceil(width/2))
-
-    min_lag = int(np.fix(parameters['f0_min']/delta - center))
-    max_lag = int(np.fix(parameters['f0_max']/delta + center))
-
-    if (min_lag < 1):
-        min_lag = 1
-        print('Min_lag is too low and adjusted ({}).'.format(min_lag))
-
-    if max_lag > (len(data) - width):
-        max_lag = len(data) - width
-        print('Max_lag is too high and adjusted ({}).'.format(max_lag))
-
-    pitch = np.zeros((maxpeaks))
-    merit = np.zeros((maxpeaks))
-
-    #---------------------------------------------------------------
-    # Main routine.
-    #---------------------------------------------------------------
-    max_data = max(data[min_lag:max_lag+1])
-
-    if (max_data > epsilon):
-        data = data/max_data
-
-    avg_data = np.mean(data[min_lag:max_lag+1])
-
-    if (avg_data > 1/PEAK_THRESH1):
-        pitch = np.zeros((maxpeaks))
-        merit = np.ones((maxpeaks))
-        return pitch, merit
-
-    #---------------------------------------------------------------
-    #Step1 (this step was implemented differently than in original version)
-    #---------------------------------------------------------------
-    numpeaks = 0
-    vec_back = (data[min_lag+center+1:max_lag-center+1] >
-                                            data[min_lag+center:max_lag-center])
-    vec_forw = (data[min_lag+center+1:max_lag-center+1] >
-                                        data[min_lag+center+2:max_lag-center+2])
-    above_thresh = (data[min_lag+center+1:max_lag-center+1] >
-                                        PEAK_THRESH2*avg_data)
-    peaks = np.logical_and(np.logical_and(vec_back, vec_forw), above_thresh)
-
-    for n in (peaks.ravel().nonzero()[0]+min_lag+center+1).tolist():
-        if np.argmax(data[n-center:n+center+1]) == center:
-            if numpeaks >= maxpeaks:
-                pitch = np.append(pitch, np.zeros((1)))
-                merit = np.append(merit, np.zeros((1)))
-
-            pitch[numpeaks] = float(n)*delta
-            merit[numpeaks] = data[n]
-            numpeaks += 1
-
-    #---------------------------------------------------------------
-    #Step2
-    #---------------------------------------------------------------
-    if (max(merit)/avg_data < PEAK_THRESH1):
-        pitch = np.zeros((maxpeaks))
-        merit = np.ones((maxpeaks))
-        return pitch, merit
-
-    #---------------------------------------------------------------
-    #Step3
-    #---------------------------------------------------------------
-    idx = (-merit).ravel().argsort().tolist()
-    merit = merit[idx]
-    pitch = pitch[idx]
-
-    numpeaks = min(numpeaks, maxpeaks)
-    pitch = np.append(pitch[:numpeaks], np.zeros((maxpeaks-numpeaks)))
-    merit = np.append(merit[:numpeaks], np.zeros((maxpeaks-numpeaks)))
-
-    #---------------------------------------------------------------
-    #Step4
-    #---------------------------------------------------------------
-
-    if (0 < numpeaks < maxpeaks):
-        pitch[numpeaks:maxpeaks] = pitch[0]
-        merit[numpeaks:maxpeaks] = merit[0]
-
-    else:
-        pitch = np.zeros((maxpeaks))
-        merit = np.ones((maxpeaks))
-
-    return np.transpose(pitch), np.transpose(merit)
+def postprocessing(pitch_track, pitch_obj, parameters):
+    
+    """Apply median filtering and fix octave jumps"""
+    # Apply median filter to smooth the pitch track
+    filter_order = parameters['median_value']
+    pitch_track = medfilt(pitch_track, filter_order)
+    
+    # Fix octave jumps
+    f0_min = parameters['f0_min']
+    f0_max = parameters['f0_max']
+    f0_double = parameters['f0_double']
+    f0_half = parameters['f0_half']
+    
+    # Find voiced segments
+    voiced = pitch_track > 0
+    voiced_indices = np.where(voiced)[0]
+    
+    # Apply octave jump correction
+    for i in range(1, len(voiced_indices)):
+        idx = voiced_indices[i]
+        prev_idx = voiced_indices[i-1]
+        
+        # Check if consecutive voiced frames
+        if prev_idx == idx - 1:
+            curr_pitch = pitch_track[idx]
+            prev_pitch = pitch_track[prev_idx]
+            
+            # Check for doubling
+            if curr_pitch > prev_pitch * 1.8 and curr_pitch > f0_double:
+                pitch_track[idx] = curr_pitch / 2
+            
+            # Check for halving
+            elif curr_pitch * 1.8 < prev_pitch and prev_pitch > f0_half:
+                pitch_track[idx] = curr_pitch * 2
+    
+    # Ensure pitch values are within valid range
+    pitch_track[pitch_track < f0_min] = 0
+    pitch_track[pitch_track > f0_max] = 0
+    
+    return pitch_track
 
 """
-Dynamic programming used to compute local and transition cost matrices,
-enabling the lowest cost tracking of pitch candidates.
-It uses NFLER from the spectrogram and the highly robust spectral F0 track,
-plus the merits, for computation of the cost matrices.
-Corresponds to the dynamic5.m file.
+Checks CUDA status
 """
-def dynamic5(pitch_array, merit_array, k1, f0_min):
+def is_cuda_available():
+    """Check if CUDA is available for use with pYAAPT."""
+    return CUDA_AVAILABLE
 
-    num_cand = pitch_array.shape[0]
-    num_frames = pitch_array.shape[1]
-
-    local = 1-merit_array
-    trans = np.zeros((num_cand, num_cand, num_frames))
-
-    trans[:, :, 1:] = abs(pitch_array[:, 1:].reshape(1, num_cand, num_frames-1) -
-                    pitch_array[:, :-1].reshape(num_cand, 1, num_frames-1))/f0_min
-    trans[:, :, 1:] = 0.05*trans[:, :, 1:] + trans[:, :, 1:]**2
-
-    trans = k1*trans
-    path = path1(local, trans, num_cand, num_frames)
-
-    final_pitch = pitch_array[path, range(num_frames)]
-
-    return final_pitch
+def cuda_info():
+    """Return detailed information about CUDA availability and configuration."""
+    if not _has_cuda:
+        return {"available": False, "reason": "CUDA utilities not imported"}
+    return get_cuda_info()
 
 """
-Finds the optimal path with the lowest cost if two matrice(Local cost matrix
-and Transition cost) are given.
-Corresponds to the path1.m file.
+Creates a matrix by taking advantage of the array strides. This is used
+to simulate the usage of overlapping windows without having to make actual
+copies of the data.
 """
-def path1(local, trans, n_lin, n_col):
-
-# Apparently the following lines are somehow kind of useless.
-# Therefore, I removed them in the version 1.0.3.
-
-#    if n_lin >= 100:
-#        print 'Stop in Dynamic due to M>100'
-#        raise KeyboardInterrupt
-#
-#    if n_col >= 1000:
-#        print 'Stop in Dynamic due to N>1000'
-#        raise KeyboardInterrupt
-
-    PRED = np.zeros((n_lin, n_col), dtype=int)
-    P = np.ones((n_col), dtype=int)
-    p_small = np.zeros((n_col), dtype=int)
-
-    PCOST = np.zeros((n_lin))
-    CCOST = np.zeros((n_lin))
-    PCOST = local[:, 0]
-
-    for I in range(1, n_col):
-
-        aux_matrix = PCOST+np.transpose(trans[:, :, I])
-        K = n_lin-np.argmin(aux_matrix[:, ::-1], axis=1)-1
-        PRED[:, I] = K
-        CCOST = PCOST[K]+trans[K, range(n_lin), I]
-
-        assert CCOST.any() < 1.0E+30, 'CCOST>1.0E+30, Stop in Dynamic'
-        CCOST = CCOST+local[:, I]
-
-        PCOST[:] = CCOST
-        J = n_lin - np.argmin(CCOST[::-1])-1
-        p_small[I] = J
-
-    P[-1] = p_small[-1]
-
-    for I in range(n_col-2, -1, -1):
-        P[I] = PRED[P[I+1], I+1]
-
-    return P
+def stride_matrix(x, n, noverlap=0):
+    # This function was kept for backwards compatibility, but is now deprecated
+    # in favor of numpy.lib.stride_tricks.sliding_window_view
+    return stride_tricks.sliding_window_view(x, n)[::n-noverlap]
 
 """
-Computes the NCCF (Normalized cross correlation Function) sequence based on
-the RAPT algorithm discussed by DAVID TALKIN.
-Corresponds to the crs_corr.m file.
+Normalized Cross Correlation Function. Used in centers finds and nlfer.
 """
-def crs_corr(data, lag_min, lag_max):
-
-    eps1 = 0.0
-    data_len = len(data)
-    N = data_len-lag_max
-
-    error_str = 'ERROR: Negative index in the cross correlation calculation of '
-    error_str += 'the pYAAPT time domain analysis. Please try to increase the '
-    error_str += 'value of the "tda_frame_length" parameter.'
-    assert N>0, error_str
-
-    phi = np.zeros((data_len))
-    data -= np.mean(data)
-    x_j = data[0:N]
-    x_jr = data[lag_min:lag_max+N]
-    p = np.dot(x_j, x_j)
-
-    x_jr_matrix = stride_matrix(x_jr, lag_max-lag_min, N, 1)
-
-    formula_nume = np.dot(x_jr_matrix, x_j)
-    formula_denom = np.sum(x_jr_matrix*x_jr_matrix, axis=1)*p + eps1
-
-    phi[lag_min:lag_max] = formula_nume/np.sqrt(formula_denom)
-
-    return phi
-
-"""
-Computes pitch estimates and the corresponding merit values associated with the
-peaks found in each frame based on the correlation sequence.
-Corresponds to the cmp_rate.m file.
-"""
-def cmp_rate(phi, fs, maxcands, lag_min, lag_max, parameters):
-
-    #---------------------------------------------------------------
-    # Set parameters.
-    #---------------------------------------------------------------
-    width = parameters['nccf_pwidth']
-    center = int(np.fix(width/2.0))
-    merit_thresh1 = parameters['nccf_thresh1']
-    merit_thresh2 = parameters['nccf_thresh2']
-
-    numpeaks = 0
-    pitch = np.zeros((maxcands))
-    merit = np.zeros((maxcands))
-
-    #---------------------------------------------------------------
-    # Main routine.
-    #(this step was implemented differently than in original version)
-    #---------------------------------------------------------------
-    vec_back = (phi[lag_min+center:lag_max-center+1] >
-                                            phi[lag_min+center-1:lag_max-center])
-    vec_forw = (phi[lag_min+center:lag_max-center+1] >
-                                        phi[lag_min+center+1:lag_max-center+2])
-    above_thresh = phi[lag_min+center:lag_max-center+1] > merit_thresh1
-    peaks = np.logical_and(np.logical_and(vec_back, vec_forw), above_thresh)
-
-    peaks = (peaks.ravel().nonzero()[0]+lag_min+center).tolist()
-
-    if np.amax(phi) > merit_thresh2 and len(peaks) > 0:
-        max_point = peaks[np.argmax(phi[peaks])]
-        pitch[numpeaks] = fs/float(max_point+1)
-        merit[numpeaks] = np.amax(phi[peaks])
-        numpeaks += 1
-    else:
-        for n in peaks:
-            if np.argmax(phi[n-center:n+center+1]) == center:
-                try:
-                    pitch[numpeaks] = fs/float(n+1)
-                    merit[numpeaks] = phi[n]
-                except:
-                    pitch = np.hstack((pitch, fs/float(n+1)))
-                    merit = np.hstack((merit, phi[n]))
-                numpeaks += 1
-
-    #---------------------------------------------------------------
-    # Sort the results.
-    #---------------------------------------------------------------
-    idx = (-merit).ravel().argsort().tolist()
-    merit = merit[idx[:maxcands]]
-    pitch = pitch[idx[:maxcands]]
-
-    if (np.amax(merit) > 1.0):
-        merit = merit/np.amax(merit)
-
-    return pitch, merit
-
-"""
---------------------------------------------
-                Extra functions.
---------------------------------------------
-"""
-
-def stride_matrix(vector, n_lin, n_col, hop):
-
-    data_matrix = stride_tricks.as_strided(vector, shape=(n_lin, n_col),
-                        strides=(vector.strides[0]*hop, vector.strides[0]))
-
-    return data_matrix
+def crs_corr(frame, window_len):
+    # This function was kept for backwards compatibility
+    # The functionality is now incorporated directly into the time_track function
+    nccf = np.zeros(len(frame) - window_len)
+    
+    for lag in range(len(frame) - window_len):
+        x1 = frame[:window_len]
+        x2 = frame[lag:lag+window_len]
+        
+        # Calculate normalized cross-correlation
+        numerator = np.sum(x1 * x2)
+        denominator = np.sqrt(np.sum(x1**2) * np.sum(x2**2))
+        
+        if denominator > 0:
+            nccf[lag] = numerator / denominator
+    
+    return nccf
