@@ -36,7 +36,7 @@ class SignalObj(object):
             data = args[0] if len(args) == 2 else kwargs['data']
             fs = args[1] if len(args) == 2 else kwargs['fs']
 
-            self.data = data
+            self.data = np.asarray(data)  # Ensure data is a numpy array
             self.fs = fs
 
 
@@ -45,6 +45,10 @@ class SignalObj(object):
         if self.data.dtype.kind == 'i':
             self.nbits = self.data.itemsize*8
             self.data = pcm2float(self.data, output_dtype)
+
+        # Ensure data is properly shaped for length calculation
+        if hasattr(self.data, 'squeeze'):
+            self.data = self.data.squeeze()
 
         self.size = len(self.data)
         self.fs = float(self.fs)
@@ -109,4 +113,3 @@ def pcm2float(sig, output_dtype=np.float64):
     # Note that 'min' has a greater (by 1) absolute value than 'max'!
     # Therefore, we use 'min' here to avoid clipping.
     return sig.astype(out_dtype) / out_dtype.type(-np.iinfo(sig.dtype).min)
-

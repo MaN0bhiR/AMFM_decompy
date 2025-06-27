@@ -527,6 +527,7 @@ def yaapt(signal, **kwargs):
             Auxiliary Functions.
 --------------------------------------------
 """
+#Cuda
 """
 Normalized Low Frequency Energy Ratio function, used to determine voiced/
 unvoiced frames.
@@ -814,9 +815,8 @@ def time_track(signal, spec_pitch, pitch_std, pitch, parameters):
     
     return time_pitch, time_merit
 
-"""
-Use dynamic programming to find the final pitch track.
-"""
+""" Use dynamic programming to find the final pitch track. """
+
 def dynamic(pitch_cands, pitch_merit, vuv, parameters, use_cuda=False):
 
     #---------------------------------------------------------------
